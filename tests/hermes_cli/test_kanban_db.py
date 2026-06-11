@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import types
@@ -248,11 +249,77 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
             conn,
             title="bad branch",
             workspace_kind="scratch",
-            branch_name="wt/bad",
+            branch_name="feature/nope",
         )
 
 
-# ---------------------------------------------------------------------------
+def test_worktree_dispatch_uses_isolated_git_worktree_from_board_default(
+    kanban_home, tmp_path, monkeypatch, all_assignees_spawnable
+):
+    """Implementation tasks must not run in the board's main checkout.
+
+    Boards use ``default_workdir`` to identify the source repository. A
+    ``workspace_kind=worktree`` task with a branch should be dispatched in a
+    separate git worktree, leaving the main checkout on its original branch.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True)
+
+    kb.create_board("impl", default_workdir=str(repo))
+    spawned: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.id, workspace))
+        return 12345
+
+    with kb.connect(board="impl") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="implementation",
+            assignee="alice",
+            workspace_kind="worktree",
+            branch_name="kanban/impl/test-worktree-isolation",
+            board="impl",
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="impl")
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned
+    assert spawned
+    workspace = Path(spawned[0][1])
+    assert workspace != repo
+    assert repo not in [workspace, *workspace.parents]
+    assert workspace.exists()
+    assert (workspace / ".git").exists()
+    assert task is not None
+    assert task.workspace_path == str(workspace)
+
+    worktree_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=workspace,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    main_branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+
+    assert worktree_branch == "kanban/impl/test-worktree-isolation"
+    assert main_branch == "main"
+
+
+
 # Links + dependency resolution
 # ---------------------------------------------------------------------------
 

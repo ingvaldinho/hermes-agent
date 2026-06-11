@@ -2129,7 +2129,7 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
-    if workspace_path is None and workspace_kind in {"dir", "worktree"}:
+    if workspace_path is None and workspace_kind == "dir":
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
@@ -4591,16 +4591,33 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        if not task.workspace_path:
-            # Default: .worktrees/<id>/ under CWD.  Worker skill creates it.
-            return Path.cwd() / ".worktrees" / task.id
-        p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
-            raise ValueError(
-                f"task {task.id} has non-absolute worktree path "
-                f"{task.workspace_path!r}; use an absolute path"
-            )
-        return p
+        board_slug = board if board else get_current_board()
+        board_meta = read_board_metadata(board_slug)
+        board_default = board_meta.get("default_workdir")
+        source_repo = Path(board_default).expanduser() if board_default else Path.cwd()
+        if not source_repo.is_absolute():
+            source_repo = source_repo.resolve()
+
+        if task.workspace_path:
+            p = Path(task.workspace_path).expanduser()
+            if not p.is_absolute():
+                raise ValueError(
+                    f"task {task.id} has non-absolute worktree path "
+                    f"{task.workspace_path!r}; use an absolute path"
+                )
+            # Back-compat/safety: older tasks may have inherited the board's
+            # default_workdir as workspace_path. Treat that as the source repo,
+            # not as the worker cwd, otherwise implementation tasks run in the
+            # main checkout and violate the worktree isolation contract.
+            try:
+                same_as_source = p.resolve() == source_repo.resolve()
+            except OSError:
+                same_as_source = False
+            target = workspaces_root(board=board) / task.id if same_as_source else p
+        else:
+            target = workspaces_root(board=board) / task.id
+        _ensure_git_worktree(source_repo, target, task.branch_name)
+        return target
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
@@ -4612,6 +4629,66 @@ def set_workspace_path(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
         )
+
+
+def _run_git_for_worktree(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run a git command for workspace setup with useful errors."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _is_git_checkout(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        _run_git_for_worktree(["rev-parse", "--show-toplevel"], cwd=path)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _ensure_git_worktree(source_repo: Path, target: Path, branch_name: Optional[str]) -> None:
+    """Ensure ``target`` is a git worktree checked out from ``source_repo``."""
+    source_repo = source_repo.expanduser()
+    target = target.expanduser()
+    if not source_repo.is_absolute():
+        raise ValueError(f"source repository path must be absolute: {source_repo}")
+    if not target.is_absolute():
+        raise ValueError(f"worktree path must be absolute: {target}")
+    if not _is_git_checkout(source_repo):
+        raise ValueError(f"source repository is not a git checkout: {source_repo}")
+    if target.exists():
+        if _is_git_checkout(target):
+            if branch_name:
+                current = _run_git_for_worktree(
+                    ["branch", "--show-current"], cwd=target
+                ).stdout.strip()
+                if current != branch_name:
+                    raise ValueError(
+                        f"existing worktree {target} is on branch {current!r}, "
+                        f"expected {branch_name!r}"
+                    )
+            return
+        if any(target.iterdir()):
+            raise ValueError(f"worktree target exists and is not empty: {target}")
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = ["worktree", "add"]
+    if branch_name:
+        cmd.extend(["-B", branch_name])
+    cmd.extend([str(target), "HEAD"])
+    try:
+        _run_git_for_worktree(cmd, cwd=source_repo)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise RuntimeError(f"git worktree add failed for {target}: {stderr}") from exc
 
 
 # ---------------------------------------------------------------------------
