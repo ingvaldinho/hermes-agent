@@ -1,6 +1,7 @@
 name: Fork approval ingress v4
 
 # Validation limitée au fork du propriétaire. Cette branche ne déploie rien.
+# Les Actions doivent être activées sur le fork pour que le push crée un run.
 on:
   push:
     branches:
