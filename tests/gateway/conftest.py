@@ -121,6 +121,12 @@ def _ensure_telegram_mock() -> None:
     """
     if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
         return  # Real library is installed — nothing to mock
+    try:
+        import telegram  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        return  # Import the installed SDK before deciding to install the mock
 
     mod = MagicMock()
     mod.ext.ContextTypes.DEFAULT_TYPE = type(None)

@@ -6465,14 +6465,59 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)
 
+    async def _handle_approval_ingress(self, msg, update) -> bool:
+        """Consume Telegram approval decisions before group gating, batching or session creation.
+
+        Caller authentication has already succeeded.  The local ingress receives only the
+        authenticated envelope and exact text; it cannot create a gateway session or agent turn.
+        """
+        from gateway.approval_ingress import handle_telegram_decision
+
+        extra = getattr(self.config, "extra", None) or {}
+
+        def _configured_id(name: str) -> Optional[int]:
+            value = extra.get(name)
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        result = await handle_telegram_decision(
+            text=msg.text,
+            chat_id=getattr(getattr(msg, "chat", None), "id", None),
+            author_id=getattr(getattr(msg, "from_user", None), "id", None),
+            event_id=getattr(update, "update_id", None),
+            timestamp=getattr(msg, "date", None),
+            socket_path=str(extra.get("approval_ingress_socket_path") or "") or None,
+            expected_peer_uid=_configured_id("approval_ingress_peer_uid"),
+            expected_socket_uid=_configured_id("approval_ingress_socket_uid"),
+            expected_socket_gid=_configured_id("approval_ingress_socket_gid"),
+            timeout=self._env_float_clamped(
+                "HERMES_APPROVAL_INGRESS_TIMEOUT_SECONDS",
+                extra.get("approval_ingress_timeout_seconds", 2.0), min_value=0.05, max_value=10.0),
+        )
+        if not result.consumed:
+            return False
+        try:
+            await _await_with_thread_deadline(
+                msg.reply_text(result.acknowledgement), timeout=_TEXT_SEND_DEADLINE,
+                label="telegram-approval-ack", dump_on_blocked_loop=False)
+        except Exception:
+            logger.warning("[Telegram] Approval acknowledgement delivery failed", exc_info=True)
+        return True
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
+        # Auth check first: blocked users must not reach approval ingress, batching, transcript or agent.
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        # This barrier is deliberately before _gate_or_observe and MessageEvent construction: even a
+        # malformed approval-looking message is consumed without creating any session/agent transcript.
+        if await self._handle_approval_ingress(msg, update):
             return
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
@@ -6484,10 +6529,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if not self._should_process_message(msg, is_command=True):
-            return
+        # Slash-prefixed APPROUVER/REFUSER lookalikes are routed here by PTB, not
+        # to _handle_text_message.  Apply the same authenticated pre-session barrier.
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        if await self._handle_approval_ingress(msg, update):
+            return
+        if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
         event = await self._build_triggered_event(msg, update, MessageType.COMMAND)
