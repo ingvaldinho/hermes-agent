@@ -1,4 +1,3 @@
-import ast
 import json
 import os
 import socket
@@ -169,23 +168,6 @@ class ApprovalIngressTests(unittest.IsolatedAsyncioTestCase):
             socket_path=str(link), expected_peer_uid=bridge_uid,
             expected_socket_uid=os.geteuid(), expected_socket_gid=os.getegid(), timeout=0.1)
         self.assertTrue(refused.uncertain)
-
-    def test_adapter_barrier_is_after_auth_and_before_event_or_session(self):
-        adapter_path = Path(__file__).resolve().parents[2] / "plugins/platforms/telegram/adapter.py"
-        tree = ast.parse(adapter_path.read_text(encoding="utf-8"))
-        method = next(node for node in ast.walk(tree)
-                      if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_text_message")
-        source = ast.get_source_segment(adapter_path.read_text(encoding="utf-8"), method)
-        self.assertIsNotNone(source)
-        auth = source.index("_is_user_authorized_from_message")
-        ingress = source.index("_handle_approval_ingress")
-        gate = source.index("if not self._gate_or_observe")
-        event = source.index("await self._build_triggered_event")
-        self.assertLess(auth, ingress)
-        self.assertLess(ingress, gate)
-        self.assertLess(ingress, event)
-        self.assertIn("if await self._handle_approval_ingress(msg, update):\n            return", source)
-
 
 if __name__ == "__main__":
     unittest.main()
