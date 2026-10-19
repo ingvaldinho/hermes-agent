@@ -127,6 +127,45 @@ def _peer_uid(sock: socket.socket) -> int:
     return uid
 
 
+def _sender_uid(ancillary: list[tuple[int, int, bytes]], flags: int) -> int:
+    """Authenticate the process that sent a response chunk, not the listener creator."""
+    if flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC):
+        raise OSError("approval ingress response or credentials truncated")
+    credentials = [value for level, kind, value in ancillary
+                   if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS]
+    if len(credentials) != 1 or len(credentials[0]) != struct.calcsize("3i"):
+        raise PermissionError("approval ingress response credentials missing")
+    _pid, uid, _gid = struct.unpack("3i", credentials[0])
+    return uid
+
+
+def _read_attested_line(sock: socket.socket, expected_sender_uid: int,
+                        deadline: float, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("approval ingress deadline exceeded")
+        sock.settimeout(remaining)
+        chunk, ancillary, flags, _address = sock.recvmsg(
+            min(512, limit + 1 - total), socket.CMSG_SPACE(struct.calcsize("3i")),
+        )
+        if not chunk:
+            raise OSError("truncated approval ingress message")
+        if _sender_uid(ancillary, flags) != expected_sender_uid:
+            raise PermissionError("approval ingress response sender uid mismatch")
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("approval ingress response exceeds size limit")
+        if b"\n" in chunk:
+            raw = b"".join(chunks)
+            if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+                raise ValueError("malformed approval ingress response framing")
+            return raw[:-1]
+
+
 def _exchange(
     path: str,
     expected_peer_uid: int,
@@ -163,29 +202,21 @@ def _exchange(
     try:
         sock.settimeout(max(0.05, deadline - time.monotonic()))
         sock.connect(path)
-        if _peer_uid(sock) != expected_peer_uid:
-            raise PermissionError("approval ingress peer uid mismatch")
+        # With a systemd-inherited listener, SO_PEERCRED identifies systemd at
+        # listen(2), while SCM_CREDENTIALS identifies the process sending data.
+        if _peer_uid(sock) != socket_uid:
+            raise PermissionError("approval ingress listener uid mismatch")
+        if not hasattr(socket, "SO_PASSCRED") or not hasattr(socket, "SCM_CREDENTIALS"):
+            raise OSError("Unix sender credentials are unavailable")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        greeting = _read_attested_line(sock, expected_peer_uid, deadline, 16)
+        if greeting == b"DENIED":
+            return {"accepted": False, "acknowledgement": "Décision refusée."}
+        if greeting != b"READY":
+            raise ValueError("approval ingress greeting mismatch")
         sock.sendall(payload + b"\n")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("approval ingress deadline exceeded")
-            sock.settimeout(remaining)
-            chunk = sock.recv(min(512, MAX_RESPONSE_BYTES + 1 - total))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > MAX_RESPONSE_BYTES:
-                raise ValueError("approval ingress response exceeds size limit")
-            if b"\n" in chunk:
-                break
-        raw = b"".join(chunks)
-        if not raw.endswith(b"\n"):
-            raise OSError("truncated approval ingress response")
-        value = json.loads(raw[:-1].decode("utf-8"))
+        raw = _read_attested_line(sock, expected_peer_uid, deadline, MAX_RESPONSE_BYTES)
+        value = json.loads(raw.decode("utf-8"))
         if not isinstance(value, dict) or set(value) - {"accepted", "acknowledgement", "uncertain"}:
             raise ValueError("malformed approval ingress response")
         return value

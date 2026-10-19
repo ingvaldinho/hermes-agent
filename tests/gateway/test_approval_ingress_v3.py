@@ -15,6 +15,7 @@ import pytest
 from gateway.approval_ingress import (
     APPROVAL_STATES,
     IngressResult,
+    _sender_uid,
     classify_decision_text,
     handle_telegram_decision,
 )
@@ -64,6 +65,20 @@ def test_exact_parser_and_shared_states():
     assert classify_decision_text("ordinary message") == (False, None)
     for ordinary in ("please APPROUVER ref", "we should REFUSER that", "approval reference"):
         assert classify_decision_text(ordinary) == (False, None)
+
+
+def test_response_sender_credentials_are_required_and_bounded():
+    credentials = [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS,
+                    struct.pack("3i", os.getpid(), os.getuid(), os.getgid()))]
+    assert _sender_uid(credentials, 0) == os.getuid()
+    with pytest.raises(PermissionError):
+        _sender_uid([], 0)
+    with pytest.raises(OSError):
+        _sender_uid(credentials, socket.MSG_CTRUNC)
+    with pytest.raises(OSError):
+        _sender_uid(credentials, socket.MSG_TRUNC)
+    with pytest.raises(PermissionError):
+        _sender_uid(credentials + credentials, 0)
 
 
 @pytest.mark.asyncio
@@ -139,6 +154,10 @@ def _start_server(path, response, captured, *, drip=False, mode=0o660):
         try:
             conn, _ = server.accept()
             conn.settimeout(2)
+            try:
+                conn.sendall(b"READY\n")
+            except (BrokenPipeError, ConnectionResetError):
+                return
             if hasattr(socket, "SO_PEERCRED"):
                 raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
                 captured["peer_uid"] = struct.unpack("3i", raw)[1]
@@ -183,7 +202,7 @@ async def test_local_transport_is_bounded_and_peer_authenticated(approval_socket
     path = approval_socket_path()
     captured = {}
     bridge_uid = os.geteuid() + 1
-    monkeypatch.setattr("gateway.approval_ingress._peer_uid", lambda sock: bridge_uid)
+    monkeypatch.setattr("gateway.approval_ingress._sender_uid", lambda ancillary, flags: bridge_uid)
     thread, failures = _start_server(
         path, {"accepted": True, "acknowledgement": "stored"}, captured)
     try:
@@ -203,11 +222,11 @@ async def test_local_transport_is_bounded_and_peer_authenticated(approval_socket
 
 
 @pytest.mark.asyncio
-async def test_wrong_peer_uid_and_slow_drip_are_uncertain(approval_socket_path, monkeypatch):
+async def test_wrong_sender_uid_and_slow_drip_are_uncertain(approval_socket_path, monkeypatch):
     bridge_uid = os.geteuid() + 1
     for index, (drip, timeout) in enumerate(((False, 1), (True, 0.1))):
         if drip:
-            monkeypatch.setattr("gateway.approval_ingress._peer_uid", lambda sock: bridge_uid)
+            monkeypatch.setattr("gateway.approval_ingress._sender_uid", lambda ancillary, flags: bridge_uid)
         path = approval_socket_path()
         captured = {}
         thread, failures = _start_server(path, {"accepted": True}, captured, drip=drip)
@@ -220,6 +239,26 @@ async def test_wrong_peer_uid_and_slow_drip_are_uncertain(approval_socket_path, 
         finally:
             _finish_server(thread, failures)
         assert result.consumed and result.uncertain and not result.accepted
+        if not drip:
+            assert "event" not in captured
+
+
+@pytest.mark.asyncio
+async def test_wrong_listener_uid_refuses_before_sending_event(approval_socket_path, monkeypatch):
+    path = approval_socket_path()
+    captured = {}
+    thread, failures = _start_server(path, {"accepted": True}, captured)
+    monkeypatch.setattr("gateway.approval_ingress._peer_uid", lambda sock: os.geteuid() + 2)
+    try:
+        result = await handle_telegram_decision(
+            text="APPROUVER ref", chat_id="1", author_id="2", event_id="3",
+            timestamp=None, socket_path=str(path), expected_peer_uid=os.geteuid() + 1,
+            expected_socket_uid=os.geteuid(), expected_socket_gid=os.getegid(),
+        )
+    finally:
+        _finish_server(thread, failures)
+    assert result.consumed and result.uncertain and not result.accepted
+    assert "event" not in captured
 
 
 def _adapter():

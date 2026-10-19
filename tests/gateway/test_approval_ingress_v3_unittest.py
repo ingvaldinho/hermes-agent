@@ -54,6 +54,10 @@ def start_server(path, response, captured, *, drip=False):
         try:
             conn, _ = server.accept()
             conn.settimeout(2)
+            try:
+                conn.sendall(b"READY\n")
+            except (BrokenPipeError, ConnectionResetError):
+                return
             data = b""
             while not data.endswith(b"\n"):
                 chunk = conn.recv(512)
@@ -119,8 +123,8 @@ class ApprovalIngressTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(result.accepted)
                 self.assertFalse(result.uncertain)
 
-    @mock.patch("gateway.approval_ingress._peer_uid", return_value=os.geteuid() + 1)
-    async def test_transport_exact_envelope_deadline_and_symlink(self, _peer_uid):
+    @mock.patch("gateway.approval_ingress._sender_uid", return_value=os.geteuid() + 1)
+    async def test_transport_exact_envelope_deadline_and_symlink(self, _sender_uid):
         bridge_uid = os.geteuid() + 1
         path = short_artifact_path()
         self.addCleanup(path.unlink, missing_ok=True)
