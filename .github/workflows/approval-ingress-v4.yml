@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - ci/remediation-v4
+      - fix/approval-socket-sender-credentials
   workflow_dispatch:
 
 permissions:
